@@ -776,6 +776,8 @@ jobs:
           if [ -f cmake/modules/FindLibZip.cmake ]; then
             echo "Patching FindLibZip.cmake to avoid hard GnuTLS dependency..."
             sed -i 's/find_package(GnuTLS MODULE REQUIRED)/find_package(GnuTLS MODULE QUIET)/' cmake/modules/FindLibZip.cmake
+            # Variante actual de Kodi 22: find_package(GnuTLS REQUIRED ${SEARCH_QUIET}) -> sin REQUIRED
+            sed -i -E 's/find_package\(GnuTLS( MODULE)? REQUIRED/find_package(GnuTLS\1/' cmake/modules/FindLibZip.cmake
             sed -i '/set(CMAKE_ARGS -DBUILD_DOC=OFF/a\                 -DENABLE_GNUTLS=OFF\n                 -DENABLE_OPENSSL=ON\n                 -DENABLE_MBEDTLS=OFF\n                 -DENABLE_WINDOWS_CRYPTO=OFF\n                 -DENABLE_COMMONCRYPTO=OFF' cmake/modules/FindLibZip.cmake
             echo "Patched lines:"
             grep -n "GnuTLS\|ENABLE_GNUTLS\|ENABLE_OPENSSL\|ENABLE_MBEDTLS" cmake/modules/FindLibZip.cmake || true
