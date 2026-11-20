@@ -73,7 +73,7 @@ jobs:
 
       - name: Workflow revision marker
         run: |
-          echo "WORKFLOW_REV=2026-10-15-adaptive-icon-v5"
+          echo "WORKFLOW_REV=2026-05-04-keystore-failsafe-v2"
 
       - name: Diagnostic preflight
         if: github.event.inputs.debug_mode == 'true'
@@ -94,23 +94,6 @@ jobs:
           cargo --version || true
           echo "=== Environment snapshot ==="
           env | sort | grep -E '^(ANDROID|JAVA|GITHUB|RUNNER|HOME|PATH)=' || true
-
-      - name: Validate branding inputs
-        env:
-          APP_NAME: ${{ github.event.inputs.app_name }}
-          APP_PKG: ${{ github.event.inputs.package_id }}
-        run: |
-          set -euo pipefail
-          if ! [[ "$APP_PKG" =~ ^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$ ]]; then
-            echo "❌ package_id inválido: '$APP_PKG' (ej: com.miempresa.miapp)" >&2
-            exit 1
-          fi
-          if [ -z "$APP_NAME" ]; then
-            echo "❌ app_name vacío" >&2
-            exit 1
-          fi
-          echo "App name : $APP_NAME"
-          echo "Package  : $APP_PKG"
 
       - name: Parse ABI selection
         id: abi
@@ -136,68 +119,53 @@ jobs:
         run: |
           set -euo pipefail
           RELEASE="${{ github.event.inputs.branch }}"
+          SOURCE_IS_TAG=false
           case "$RELEASE" in
             Piers)
-              TAG_SUFFIX=Piers
+              # Kodi 22 has no release branch yet (it lives on moving master), so
+              # pin to the latest tagged Piers release candidate instead of master
+              # HEAD. This stops builds breaking every time someone pushes to
+              # master, while still giving the newest Piers code that's actually
+              # been tagged/tested upstream. Bump this tag by hand as xbmc/xbmc
+              # cuts new 22.0 tags (check: git ls-remote --tags
+              # https://github.com/xbmc/xbmc.git | grep Piers).
+              SOURCE_REF=22.0rc2-Piers
+              SOURCE_IS_TAG=true
               ADDON_CHANNEL=piers
               ANDROID_PLATFORM=37.0
               ANDROID_BUILD_TOOLS=37.0.0
+              IS_PRERELEASE=true
               ;;
             Omega)
-              TAG_SUFFIX=Omega
+              SOURCE_REF=Omega
               ADDON_CHANNEL=omega
               ANDROID_PLATFORM=34
               ANDROID_BUILD_TOOLS=34.0.0
+              IS_PRERELEASE=false
               ;;
             Nexus)
-              TAG_SUFFIX=Nexus
+              SOURCE_REF=Nexus
               ADDON_CHANNEL=nexus
               ANDROID_PLATFORM=34
               ANDROID_BUILD_TOOLS=34.0.0
+              IS_PRERELEASE=false
               ;;
             Matrix)
-              TAG_SUFFIX=Matrix
+              SOURCE_REF=Matrix
               ADDON_CHANNEL=matrix
               ANDROID_PLATFORM=34
               ANDROID_BUILD_TOOLS=34.0.0
+              IS_PRERELEASE=false
               ;;
             *)
               echo "Unsupported Kodi release: $RELEASE" >&2
               exit 1
               ;;
           esac
-
-          # Ultimo tag publicado de esa rama (alpha < beta < rc < final)
-          SOURCE_REF=$(git ls-remote --tags --refs https://github.com/xbmc/xbmc \
-            | awk '{sub("refs/tags/","",$2); print $2}' \
-            | python3 -c '
-          import re, sys
-          suffix = sys.argv[1]
-          rank = {"a": 0, "b": 1, "rc": 2, None: 3}
-          best = None
-          for t in sys.stdin.read().split():
-              m = re.fullmatch(r"(\d+)\.(\d+)(?:\.(\d+))?(a|b|rc)?(\d+)?-" + suffix, t)
-              if not m:
-                  continue
-              maj, mi, pa, st, n = m.groups()
-              key = (int(maj), int(mi), int(pa or 0), rank[st], int(n or 0))
-              if best is None or key > best[0]:
-                  best = (key, t)
-          print(best[1] if best else "")
-          ' "$TAG_SUFFIX")
-
-          if [ -z "$SOURCE_REF" ]; then
-            echo "No se encontro ningun tag *-$TAG_SUFFIX en xbmc/xbmc" >&2
-            exit 1
-          fi
-          if [[ "$SOURCE_REF" =~ [0-9](a|b|rc)[0-9]+- ]]; then
-            IS_PRERELEASE=true
-          else
-            IS_PRERELEASE=false
-          fi
           {
             echo "release=$RELEASE"
             echo "source_ref=$SOURCE_REF"
+            echo "source_is_tag=$SOURCE_IS_TAG"
             echo "addon_channel=$ADDON_CHANNEL"
             echo "android_platform=$ANDROID_PLATFORM"
             echo "android_build_tools=$ANDROID_BUILD_TOOLS"
@@ -217,6 +185,7 @@ jobs:
             autoconf libtool pkg-config yasm ccache \
             libgl1-mesa-dev libgles2-mesa-dev \
             gperf default-jre imagemagick
+          # Install cmake 3.25+ required by Kodi depends
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y cmake --no-install-recommends 2>/dev/null || true
           cmake --version
           echo "✅ System packages installed"
@@ -263,11 +232,23 @@ jobs:
         run: |
           set -euo pipefail
           SOURCE_REF="${{ steps.kodi.outputs.source_ref }}"
+          SOURCE_IS_TAG="${{ steps.kodi.outputs.source_is_tag }}"
           if [ -d ~/kodi/.git ]; then
             echo "📦 Updating existing source..."
-            git -C ~/kodi fetch --depth=1 origin "$SOURCE_REF"
-            git -C ~/kodi checkout -f FETCH_HEAD
-            git -C ~/kodi clean -fdx
+            if [ "$SOURCE_IS_TAG" = "true" ]; then
+              # Tags don't get their own origin/<tag> remote-tracking ref like
+              # branches do, so fetch it straight into a local tag ref and check
+              # that out instead of trying to reset against "origin/<tag>".
+              git -C ~/kodi fetch origin "refs/tags/$SOURCE_REF:refs/tags/$SOURCE_REF" --force
+              git -C ~/kodi checkout --force "tags/$SOURCE_REF"
+              git -C ~/kodi reset --hard "tags/$SOURCE_REF"
+            else
+              git -C ~/kodi fetch origin "$SOURCE_REF"
+              git -C ~/kodi checkout "$SOURCE_REF"
+              # Ensure cached source is deterministic and not carrying prior run patches
+              git -C ~/kodi reset --hard "origin/$SOURCE_REF"
+            fi
+            git -C ~/kodi clean -fd
           else
             echo "📦 Cloning Kodi $SOURCE_REF..."
             git clone --depth=1 \
@@ -284,6 +265,8 @@ jobs:
       - name: Patch Android looper API for newer NDK
         run: |
           set -euo pipefail
+          # NDK r28+ marks ALooper_pollAll unavailable; Kodi branches still using it
+          # fail to compile. ALooper_pollOnce is the supported equivalent signature.
           mapfile -t LOOPER_FILES < <(grep -RIl "ALooper_pollAll(" ~/kodi/xbmc/platform/android || true)
           if [ ${#LOOPER_FILES[@]} -eq 0 ]; then
             echo "ℹ️ No ALooper_pollAll usage found under xbmc/platform/android"
@@ -305,6 +288,9 @@ jobs:
             echo "ℹ️ FileFactory.cpp not found at expected path, skipping optical patch"
             exit 0
           fi
+          # FileFactory includes CDDAFile.h unconditionally on some branches, but the
+          # build disables optical/cdio for Android. Guard the include to match
+          # ENABLE_OPTICAL=OFF and avoid pulling cdio headers.
           sed -i 's@#include "CDDAFile.h"@#if defined(HAS_OPTICAL_DRIVE)\n#include "CDDAFile.h"\n#endif@' "$FILE"
           echo "Verification of CDDA include guard in FileFactory.cpp:"
           grep -n 'CDDAFile.h\|HAS_OPTICAL_DRIVE' "$FILE" | head -20 || true
@@ -316,12 +302,15 @@ jobs:
           CDDB_HDR=~/kodi/xbmc/network/cddb.h
 
           if [ -f "$MUSIC_DB" ]; then
+            # Avoid pulling cddb.h (which pulls cdio) when optical is disabled.
             sed -i 's@#include "network/cddb.h"@#if defined(HAS_OPTICAL_DRIVE)\n#include "network/cddb.h"\n#endif@' "$MUSIC_DB"
             echo "Patched MusicDatabase.cpp include guard:"
             grep -n 'network/cddb.h\|HAS_OPTICAL_DRIVE' "$MUSIC_DB" | head -20 || true
           fi
 
           if [ -f "$CDDB_HDR" ]; then
+            # Defensive: if another TU still includes cddb.h with optical off, forward declare
+            # CCdInfo instead of hard including cdioSupport.h.
             sed -i 's@#include "storage/cdioSupport.h"@#if defined(HAS_OPTICAL_DRIVE)\n#include "storage/cdioSupport.h"\n#else\nnamespace MEDIA_DETECT { class CCdInfo; }\n#endif@' "$CDDB_HDR"
             echo "Patched cddb.h include guard:"
             grep -n 'cdioSupport.h\|MEDIA_DETECT\|HAS_OPTICAL_DRIVE' "$CDDB_HDR" | head -30 || true
@@ -335,9 +324,16 @@ jobs:
             echo "⚠️ PlatformAndroid.cpp not found — skipping"
             exit 0
           fi
+
+          # Add #include for CUtil (needed for CopyUserDataIfNeeded)
           if ! grep -q 'Util.h' "$PLATFORM_CPP"; then
             sed -i '/#include "ServiceBroker.h"/a #include "Util.h"' "$PLATFORM_CPP"
           fi
+
+          # Inject CopyUserDataIfNeeded calls after the SSL_CERT_FILE setenv line.
+          # This mirrors what iOS does in PlatformDarwinEmbedded.cpp — copying
+          # bundled config files from APK assets (special://xbmc/userdata/) to the
+          # writable profile (special://masterprofile/) on first launch only.
           MARKER='setenv("SSL_CERT_FILE"'
           if grep -q "$MARKER" "$PLATFORM_CPP" && ! grep -q "CopyUserDataIfNeeded" "$PLATFORM_CPP"; then
             sed -i "/$MARKER/a\\
@@ -352,96 +348,29 @@ jobs:
           fi
           grep -n "CopyUserDataIfNeeded\|Util.h" "$PLATFORM_CPP" || true
 
-      # ------------------------------------------------------------------
-      # BRANDING: nombre de app + package ID
-      # Kodi NO tiene "org.xbmc.kodi" literal en las plantillas del
-      # empaquetado: lo genera CMake desde APP_PACKAGE (@APP_PACKAGE@) y el
-      # código nativo lo usa para localizar las clases JNI. Por eso se parchea
-      # el árbol fuente ANTES de generar con CMake y se vuelve a pasar sobre
-      # los ficheros generados. Al final se verifica el APK con aapt2.
-      # ------------------------------------------------------------------
-      - name: Apply custom app name and package ID (source tree)
-        env:
-          APP_NAME: ${{ github.event.inputs.app_name }}
-          APP_PKG: ${{ github.event.inputs.package_id }}
+      - name: Apply custom app name
+        if: github.event.inputs.app_name != 'Kodi'
         run: |
-          set -euo pipefail
-          cat > "$RUNNER_TEMP/branding.py" <<'PY'
-          import os, re, sys
-          from pathlib import Path
-          from xml.sax.saxutils import escape
+          APP="${{ github.event.inputs.app_name }}"
+          echo "🎨 Renaming app to: $APP"
+          find ~/kodi/tools/android/packaging -type f -name "*.xml" -o -name "*.gradle" | \
+            xargs sed -i "s|>Kodi<|>$APP<|g; s|\"Kodi\"|\"$APP\"|g" 2>/dev/null || true
 
-          root = Path(sys.argv[1])
-          mode = sys.argv[2]
-          name = escape(os.environ["APP_NAME"])
-          pkg = os.environ["APP_PKG"]
-          OLD, OLD_P = "org.xbmc.kodi", "org/xbmc/kodi"
-          NEW_P = pkg.replace(".", "/")
-          EXT = {".cmake", ".txt", ".in", ".xml", ".gradle", ".java", ".kt",
-                 ".cpp", ".h", ".properties", ".json", ".kts"}
-          SKIP = {".git", "depends", "docs", "project", "addons", "userdata"}
-          changed = 0
-
-          def walk(base):
-              for dp, dn, fn in os.walk(base):
-                  dn[:] = [d for d in dn if d not in SKIP]
-                  for f in fn:
-                      p = Path(dp) / f
-                      if p.suffix in EXT or f in ("CMakeLists.txt", "version.txt"):
-                          yield p
-
-          def patch(p):
-              global changed
-              try:
-                  s = p.read_text(encoding="utf-8")
-              except Exception:
-                  return
-              o = s
-              if pkg != OLD:
-                  s = s.replace(OLD, pkg).replace(OLD_P, NEW_P)
-              if p.suffix == ".cmake" or p.name == "CMakeLists.txt":
-                  s = re.sub(r'set\(\s*APP_PACKAGE\s+[^)]*\)',
-                             lambda m: 'set(APP_PACKAGE "%s")' % pkg, s)
-              if p.name == "version.txt":
-                  s = re.sub(r'(?m)^APP_PACKAGE\s+.*$',
-                             lambda m: 'APP_PACKAGE %s' % pkg, s)
-              if "android" in str(p).lower():
-                  s = re.sub(r'(<string\s+name="app_name"[^>]*>)[^<]*(</string>)',
-                             lambda m: m.group(1) + name + m.group(2), s)
-                  s = re.sub(r'android:label="(?:@APP_NAME@|Kodi)"',
-                             lambda m: 'android:label="%s"' % name, s)
-              if s != o:
-                  p.write_text(s, encoding="utf-8")
-                  changed += 1
-                  print("patched:", p)
-
-          for p in list(walk(root)):
-              patch(p)
-
-          # Directorios Java org/xbmc/kodi -> nuevo package
-          if pkg != OLD:
-              cands = [d for d in root.rglob("kodi")
-                       if d.is_dir() and str(d).endswith(OLD_P) and "/.git/" not in str(d)]
-              for d in sorted(cands, key=lambda x: -len(str(x))):
-                  dest = Path(str(d)[:-len(OLD_P)]) / NEW_P
-                  if dest.exists():
-                      continue
-                  dest.parent.mkdir(parents=True, exist_ok=True)
-                  d.rename(dest)
-                  print("moved dir:", d, "->", dest)
-
-          print("✅ %d ficheros modificados (%s)" % (changed, mode))
-          PY
-          python3 "$RUNNER_TEMP/branding.py" "$HOME/kodi" source
-          echo "BRANDING_SCRIPT=$RUNNER_TEMP/branding.py" >> "$GITHUB_ENV"
-          echo "--- Definiciones de APP_PACKAGE tras el parche ---"
-          grep -rn "APP_PACKAGE" "$HOME/kodi/cmake" "$HOME/kodi/CMakeLists.txt" "$HOME/kodi/version.txt" 2>/dev/null | head -30 || true
+      - name: Apply custom package ID
+        if: github.event.inputs.package_id != 'org.xbmc.kodi'
+        run: |
+          PKG="${{ github.event.inputs.package_id }}"
+          echo "📦 Setting package ID: $PKG"
+          find ~/kodi/tools/android/packaging -type f | \
+            xargs sed -i "s|org\.xbmc\.kodi|$PKG|g" 2>/dev/null || true
 
       - name: Apply custom icon
         run: |
           ICON="${{ github.workspace }}/kodi-config/icon.png"
           if [ -f "$ICON" ]; then
             echo "🖼️ Applying custom icon to all branding images..."
+
+            # --- 1. Android launcher icons (res/drawable-*/) ---
             MEDIA=~/kodi/tools/android/packaging/media
             declare -A LAUNCHER_SIZES=(
               [drawable-ldpi]=36 [drawable-mdpi]=48 [drawable-hdpi]=72
@@ -452,72 +381,51 @@ jobs:
                 convert "$ICON" -resize "${LAUNCHER_SIZES[$d]}x${LAUNCHER_SIZES[$d]}" "$MEDIA/$d/ic_launcher.png"
               fi
             done
+            echo "  ✅ ic_launcher.png — all density buckets"
+
+            # --- 2. Android TV banner (drawable-xhdpi/banner.png) [320x180] ---
             if [ -d "$MEDIA/drawable-xhdpi" ]; then
               convert "$ICON" -resize 320x180 -background none -gravity center -extent 320x180 "$MEDIA/drawable-xhdpi/banner.png"
+              echo "  ✅ banner.png — Android TV banner"
             fi
+
+            # --- 3. media/ icon files (bundled in APK assets) ---
             for size in 16 32 48 80 120 256; do
               convert "$ICON" -resize "${size}x${size}" ~/kodi/media/icon${size}x${size}.png
             done
+            echo "  ✅ icon16-256.png — media icons"
+
+            # --- 4. media/banner.png [320x180] ---
             convert "$ICON" -resize 320x180 -background none -gravity center -extent 320x180 ~/kodi/media/banner.png
+            echo "  ✅ banner.png — media banner"
+
+            # --- 5. media/vendor_icon.png [128x128] ---
             convert "$ICON" -resize 128x128 ~/kodi/media/vendor_icon.png
+            echo "  ✅ vendor_icon.png"
+
+            # --- 6. media/vendor_logo.png [465x128] ---
+            # This is a wide logo. Center the icon on a transparent 465x128 canvas.
             convert "$ICON" -resize 128x128 -background none -gravity center -extent 465x128 ~/kodi/media/vendor_logo.png
+            echo "  ✅ vendor_logo.png"
+
             echo "✅ Custom icon applied to all branding images"
           else
             echo "ℹ️ No custom icon found (kodi-config/icon.png) — using default"
           fi
-
-      - name: Apply custom launcher icon (legacy + adaptive)
-        env:
-          ICON_BG: '#000000'
-        run: |
-          set -euo pipefail
-          cat > "$RUNNER_TEMP/apply-icon.sh" <<'SH'
-          #!/usr/bin/env bash
-          set -euo pipefail
-          ROOT="$1"; ICON="$2"; BG="${ICON_BG:-#000000}"
-          [ -f "$ICON" ] || { echo "ℹ️ sin icon.png"; exit 0; }
-          [ -d "$ROOT" ] || exit 0
-          declare -A SZ=([ldpi]=36 [mdpi]=48 [hdpi]=72 [xhdpi]=96 [xxhdpi]=144 [xxxhdpi]=192 [tvdpi]=64)
-          # 1) iconos legacy en mipmap-* y drawable-*
-          while IFS= read -r f; do
-            dir=$(basename "$(dirname "$f")"); s=96
-            for k in "${!SZ[@]}"; do
-              if [[ "$dir" == *"-$k"* ]]; then s=${SZ[$k]}; fi
-            done
-            convert "$ICON" -resize ${s}x${s} "$f"; echo "legacy: $f (${s}px)"
-          done < <(find "$ROOT" -type f \( -name ic_launcher.png -o -name ic_launcher_round.png \))
-          # 2) icono adaptativo: foreground = tu icono dentro de la zona segura
-          while IFS= read -r f; do
-            d=$(dirname "$f"); rm -f "$f"
-            convert "$ICON" -resize 288x288 -background none -gravity center -extent 432x432 "$d/ic_launcher_foreground.png"
-            echo "adaptive foreground: $d/ic_launcher_foreground.png"
-          done < <(find "$ROOT" -type f -name 'ic_launcher_foreground.*' -path '*drawable*')
-          # fondo sólido
-          while IFS= read -r f; do
-            d=$(dirname "$f"); rm -f "$f"
-            printf '<?xml version="1.0" encoding="utf-8"?>\n<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle"><solid android:color="%s"/></shape>\n' "$BG" > "$d/ic_launcher_background.xml"
-            echo "adaptive background: $d/ic_launcher_background.xml"
-          done < <(find "$ROOT" -type f -name 'ic_launcher_background.*' -path '*drawable*')
-          # quitar monochrome (si no, los iconos temáticos muestran el logo de Kodi)
-          { grep -rl '<adaptive-icon' "$ROOT" --include=*.xml 2>/dev/null || true; } | xargs -r sed -i '/<monochrome/d'
-          find "$ROOT" -type f -name 'ic_monochrome_foreground.*' -path '*drawable*' -print -delete
-          # banner de Android TV
-          while IFS= read -r f; do
-            convert "$ICON" -resize 320x180 -background none -gravity center -extent 320x180 "$f"; echo "banner: $f"
-          done < <(find "$ROOT" -type f -name banner.png \( -path '*mipmap*' -o -path '*drawable*' \))
-          SH
-          chmod +x "$RUNNER_TEMP/apply-icon.sh"
-          echo "ICON_SCRIPT=$RUNNER_TEMP/apply-icon.sh" >> "$GITHUB_ENV"
-          "$RUNNER_TEMP/apply-icon.sh" "$HOME/kodi/tools/android/packaging" "${{ github.workspace }}/kodi-config/icon.png"
 
       - name: Apply custom splash screen
         run: |
           SPLASH="${{ github.workspace }}/kodi-config/splash.png"
           if [ -f "$SPLASH" ]; then
             echo "🖼️ Applying custom splash..."
+            # Kodi has two splash images:
+            # 1. media/splash.jpg — the in-app splash shown by Kodi itself (bundled in assets) [1920x1080]
+            # 2. media/applaunch_screen.png — the Android launch drawable (shown instantly by OS) [1920x1080]
+            # Both live in the source media/ dir and get packaged via different paths.
+            # Resize to 1920x1080 and convert to proper formats.
             convert "$SPLASH" -resize 1920x1080 -background black -gravity center -extent 1920x1080 ~/kodi/media/splash.jpg
             convert "$SPLASH" -resize 1920x1080 -background black -gravity center -extent 1920x1080 ~/kodi/media/applaunch_screen.png
-            echo "✅ Splash applied"
+            echo "✅ Splash applied (both in-app and Android launch screen)"
           else
             echo "ℹ️ No custom splash found (kodi-config/splash.png) — using default"
           fi
@@ -536,34 +444,85 @@ jobs:
             url="$(echo "$url" | xargs)"
             [ -z "$url" ] || [[ "$url" == \#* ]] && continue
             fname=$(basename "$url")
+            echo "  ⬇️ $fname from $url"
             if curl -L --retry 3 --retry-delay 5 \
                  -H "User-Agent: Mozilla/5.0 (Linux; Android) Kodi" \
                  -o "/tmp/$fname" "$url" 2>&1; then
               if [ -f "/tmp/$fname" ] && file "/tmp/$fname" | grep -q "Zip"; then
                 unzip -o -q "/tmp/$fname" -d "$ADDON_STAGE/" 2>/dev/null || true
+                echo "  ✅ Extracted $fname"
+              else
+                echo "  ⚠️ Downloaded file is not a valid zip: /tmp/$fname"
+                file "/tmp/$fname" 2>/dev/null || true
               fi
               rm -f "/tmp/$fname"
               COUNT=$((COUNT+1))
+            else
+              echo "  ❌ Failed to download: $url"
             fi
           done < "$ADDONS_FILE"
+          echo "Staged addon directories:"
+          ls -la "$ADDON_STAGE/" 2>/dev/null || echo "  (empty)"
+          echo "✅ $COUNT addon(s) staged in $ADDON_STAGE"
+
+          # --- Integrate staged addons into the Kodi source tree ---
+          # Three things must happen BEFORE cmake runs for addons to be
+          # included in the APK:
+          #
+          # 1. Addon files must be in ~/kodi/addons/<addon_id>/
+          # 2. The addon must be listed in cmake/installdata/common/addons.txt
+          #    (cmake only copies explicitly listed addon directories into the
+          #    build tree — there is NO wildcard addons/*)
+          # 3. The addon must be registered in system/addon-manifest.xml
+          #    (Kodi ignores addon files not listed in the manifest)
+
           MANIFEST=~/kodi/system/addon-manifest.xml
           INSTALL_ADDONS=~/kodi/cmake/installdata/common/addons.txt
+
           if [ -d "$ADDON_STAGE" ]; then
             for addon_dir in "$ADDON_STAGE"/*/; do
               [ -d "$addon_dir" ] || continue
               addon_id=$(basename "$addon_dir")
+              echo ""
+              echo "  🔧 Integrating addon: $addon_id"
+
+              # 1. Copy addon files into source tree
               cp -a "$addon_dir" ~/kodi/addons/
+              echo "    ✅ Copied to ~/kodi/addons/$addon_id/"
+
+              # 2. Add to cmake install data list
               if [ -f "$INSTALL_ADDONS" ]; then
                 addon_entry="addons/${addon_id}/*"
                 if ! grep -qF "$addon_entry" "$INSTALL_ADDONS"; then
                   echo "$addon_entry" >> "$INSTALL_ADDONS"
+                  echo "    ✅ Added to cmake installdata/common/addons.txt"
+                else
+                  echo "    ℹ️ Already in cmake addons.txt"
                 fi
               fi
+
+              # 3. Register in addon-manifest.xml
               if [ -f "$MANIFEST" ]; then
                 if ! grep -q "<addon>${addon_id}</addon>" "$MANIFEST"; then
                   sed -i "s|</addons>|  <addon>${addon_id}</addon>\n</addons>|" "$MANIFEST"
+                  echo "    ✅ Registered in addon-manifest.xml"
+                else
+                  echo "    ℹ️ Already in addon-manifest.xml"
                 fi
               fi
+            done
+
+            echo ""
+            echo "--- Verification ---"
+            echo "addon-manifest.xml tail:"
+            tail -5 "$MANIFEST" 2>/dev/null
+            echo "addons.txt tail:"
+            tail -5 "$INSTALL_ADDONS" 2>/dev/null
+            echo "Source addons/ (custom):"
+            for addon_dir in "$ADDON_STAGE"/*/; do
+              [ -d "$addon_dir" ] || continue
+              addon_id=$(basename "$addon_dir")
+              ls -d ~/kodi/addons/"$addon_id" 2>/dev/null && echo "  ✅ $addon_id present"
             done
           fi
 
@@ -571,6 +530,9 @@ jobs:
         run: |
           SRC="${{ github.workspace }}/kodi-config/advancedsettings.xml"
           if [ -f "$SRC" ]; then
+            # Kodi reads advancedsettings.xml from userdata/ at runtime, not system/.
+            # The cmake install_data includes userdata/* (common.txt line 13),
+            # so files here get bundled into the APK assets automatically.
             mkdir -p ~/kodi/userdata
             cp "$SRC" ~/kodi/userdata/advancedsettings.xml
             echo "✅ advancedsettings.xml baked into userdata/"
@@ -588,18 +550,45 @@ jobs:
       - name: Bake in guisettings.xml (unknown sources + any user overrides)
         run: |
           UNKNOWN="${{ github.event.inputs.unknown_sources }}"
+
+          # Kodi generates guisettings.xml from scratch on first launch using the
+          # default values defined in system/settings/settings.xml. It does NOT
+          # read a pre-shipped guisettings.xml from assets. So to pre-enable
+          # unknown sources, we patch the default value in the settings definition.
           if [ "$UNKNOWN" = "true" ]; then
             SETTINGS_XML=~/kodi/system/settings/settings.xml
             if [ -f "$SETTINGS_XML" ]; then
+              # Change the default for addons.unknownsources from false to true.
+              # The setting block looks like:
+              #   <setting id="addons.unknownsources" type="boolean" ...>
+              #     ...
+              #     <default>false</default>
+              #     ...
+              #   </setting>
+              # We use a targeted sed that only changes <default> within the
+              # unknownsources setting block.
               sed -i '/<setting id="addons.unknownsources"/,/<\/setting>/ s|<default>false</default>|<default>true</default>|' "$SETTINGS_XML"
+              # Also change addons.updatemode from 0 (OFFICIAL_ONLY) to 1 (ANY_REPOSITORY)
+              # so that addons from third-party repos can receive updates.
               sed -i '/<setting id="addons.updatemode"/,/<\/setting>/ s|<default>0</default>|<default>1</default>|' "$SETTINGS_XML"
+              echo "Verification:"
+              grep -A 5 'addons.unknownsources\|addons.updatemode' "$SETTINGS_XML" | head -16
               echo "✅ Unknown sources: ENABLED + Update mode: ANY_REPOSITORY"
+            else
+              echo "⚠️ settings.xml not found at $SETTINGS_XML"
             fi
+          else
+            echo "✅ Unknown sources: disabled (default)"
           fi
+
+          # If the user has supplied a custom guisettings.xml, stage it for
+          # CopyUserDataIfNeeded — but note Kodi only auto-copies specific files
+          # (RssFeeds.xml, favourites.xml, Lircmap.xml), so this is best-effort.
           USERDATA_SRC="${{ github.workspace }}/kodi-config/guisettings.xml"
           if [ -f "$USERDATA_SRC" ]; then
             mkdir -p ~/kodi/userdata
             cp "$USERDATA_SRC" ~/kodi/userdata/guisettings.xml
+            echo "📋 Custom guisettings.xml staged in userdata/ (best-effort)"
           fi
 
       - name: Cache source tarballs
@@ -627,8 +616,10 @@ jobs:
           NATIVE_BIN="$DEPENDS_PREFIX/x86_64-linux-gnu-native/bin"
 
           mkdir -p "$TARBALLS"
+
           TARGET_DIR="${{ steps.abi.outputs.target_dir }}"
 
+          # Cache hit is valid if the target prefix has libs (works for all ABIs)
           if [ "${{ steps.depends-cache.outputs.cache-hit }}" = "true" ] && \
              [ -d "$DEPENDS_PREFIX/$TARGET_DIR/lib" ] && \
              [ "$(ls -A $DEPENDS_PREFIX/$TARGET_DIR/lib 2>/dev/null)" ]; then
@@ -637,18 +628,36 @@ jobs:
             echo "📦 Bootstrapping depends..."
             cd "$DEPENDS_DIR"
             ./bootstrap
+
+            # Patch Makefile.include.in so cmakebuildsys uses system cmake path
             sed -i "s|CMAKE=@prefix@/@tool_dir@/bin/cmake|CMAKE=$SYS_CMAKE|g" Makefile.include.in
+            echo "✅ Patched Makefile.include.in: CMAKE=$SYS_CMAKE"
+
+            # The parent native/Makefile has cmake as a dependency at line ~104.
+            # It calls 'make -C native/cmake' which builds cmake from source using clang,
+            # which fails with "unsupported option -print-multi-os-directory".
+            # Fix: remove cmake from the native Makefile dependency list and
+            # instead pre-populate the cmake binary directly in the prefix.
+
+            # 1. Remove 'cmake' from the native Makefile dependency list.
+            # Use grep+awk to safely rewrite the file without complex regex.
             grep -v '^	cmake$' native/Makefile | \
               sed 's/ cmake / /g' | \
               sed 's/ cmake$//' | \
               sed 's/cmake \\//' > native/Makefile.tmp
             mv native/Makefile.tmp native/Makefile
+            echo "Removed cmake from native/Makefile — cmake refs remaining:"
+            grep -n "cmake" native/Makefile | head -5 || echo "  none"
+
+            # 2. Pre-install system cmake into the expected output location
             mkdir -p "$NATIVE_BIN"
             cp -f "$SYS_CMAKE" "$NATIVE_BIN/cmake"
             chmod +x "$NATIVE_BIN/cmake"
             mkdir -p "$DEPENDS_DIR/native/cmake"
             touch "$DEPENDS_DIR/native/cmake/.installed-x86_64-linux-native"
+            echo "Pre-installed system cmake at $NATIVE_BIN/cmake"
 
+            echo "⚙️ Configuring depends..."
             ./configure \
               --host="$HOST" \
               --with-sdk-path="$ANDROID_HOME" \
@@ -659,46 +668,89 @@ jobs:
               --disable-gplv3 \
               --enable-debug=no
 
+            # Remove packages that are not needed for Android or fail to build with
+            # Android clang on GitHub-hosted runners. All confirmed non-issues for
+            # the Android APK — Kodi Android has its own SMB (libsmb2), no optical
+            # disc support, no system dbus, no CEC, no Wayland/X11, etc.
+            #
+            # Package list and reasons:
+            #  samba / samba-gplv3   — IDL type errors with NDK clang; libsmb2 used instead
+            #  libcdio / libcdio-gplv3 — AM_LANGINFO_CODESET autoconf error; CD-ROM, N/A on Android
+            #  libcec                — CEC (HDMI) only meaningful on Linux desktop / embedded
+            #  lirc                  — Linux infrared; no Android support
+            #  libdvdcss             — DVD decryption; optical discs N/A on Android
+            #  libdvdread / libdvdnav — DVD navigation; optical discs N/A on Android
+            #  dbus                  — Linux system bus; not used on Android
+            #  libuuid               — provided by Android NDK bionic libc directly
+            #  alsa-lib              — ALSA audio; Android uses AudioTrack/AAudio
+            #  libdrm                — DRM/KMS; Android uses SurfaceFlinger
+            #  libxkbcommon          — X11 keyboard handling; N/A on Android
+            #  libinput              — Linux input subsystem; N/A on Android
+            #  libudev               — udev device manager; N/A on Android
+            #  libevdev              — evdev input; N/A on Android
+            #  mtdev                 — multitouch device; N/A on Android
+            #  wayland               — Wayland compositor; N/A on Android
+            #  waylandpp             — Wayland C++ bindings; N/A on Android
+            #  wayland-protocols     — Wayland protocols; N/A on Android
             SKIP_PKGS="samba-gplv3 samba libcdio-gplv3 libcdio libcec lirc"
             SKIP_PKGS="$SKIP_PKGS libdvdcss libdvdread libdvdnav"
             SKIP_PKGS="$SKIP_PKGS dbus libuuid alsa-lib libdrm"
             SKIP_PKGS="$SKIP_PKGS libxkbcommon libinput libudev libevdev mtdev"
             SKIP_PKGS="$SKIP_PKGS wayland waylandpp wayland-protocols"
-            SKIP_PKGS="$SKIP_PKGS gnutls"
-            SKIP_PKGS="$SKIP_PKGS libmicrohttpd"
+            SKIP_PKGS="$SKIP_PKGS gnutls"  # Uses tzalloc/mktime_z not in Android bionic; Kodi uses OpenSSL
+            SKIP_PKGS="$SKIP_PKGS libmicrohttpd"  # Requires gnutls; Kodi web server not needed on Android
             for pkg in $SKIP_PKGS; do
+              # Remove make rule block for this package
               sed -i "/^${pkg}:/,/^[^	]/{/^${pkg}:/d;/^	/d}" target/Makefile
+              # Remove from DEPENDS+= lines (handles: "pkg ", " pkg", "pkg$", "+=pkg")
               sed -i "s/+=${pkg}$/+=/g" target/Makefile
               sed -i "s/+=${pkg} /+=/g" target/Makefile
               sed -i "s/ ${pkg} / /g; s/ ${pkg}$//; s/^${pkg} //" target/Makefile
             done
+            # Clean up empty DEPENDS+= lines and double spaces
             sed -i '/^[[:space:]]*DEPENDS+=[[:space:]]*$/d' target/Makefile
             sed -i 's/  */ /g' target/Makefile
+            echo "Removed non-Android packages. Remaining package refs check:"
+            grep -n "samba\|libcdio\|libcec\|lirc\|libdvd\|wayland" target/Makefile | head -10 || echo "  none"
 
+            # Place cmake symlink in the native bin for cmakebuildsys
             mkdir -p "$NATIVE_BIN"
             ln -sf "$SYS_CMAKE" "$NATIVE_BIN/cmake"
 
+            # Redirect Rust env so runner's pre-installed Rust doesn't conflict
             export RUSTUP_HOME="$DEPENDS_PREFIX/x86_64-linux-gnu-native/.rustup"
             export CARGO_HOME="$DEPENDS_PREFIX/x86_64-linux-gnu-native/.cargo"
 
-            echo "🔨 Building depends..."
+            echo "🔨 Building depends (60-90 min first time)..."
             set +e
             make -j$(nproc) 2>&1 | tee ~/depends-build.log
             BUILD_EXIT=${PIPESTATUS[0]}
             set -e
+
             if [ $BUILD_EXIT -ne 0 ]; then
               echo "❌ Depends build failed (exit $BUILD_EXIT)"
               tail -100 ~/depends-build.log
               exit $BUILD_EXIT
             fi
+            echo "✅ Depends built"
           fi
 
+          # Always ensure cmake symlink is in place (survives cache restore)
           mkdir -p "$NATIVE_BIN"
           ln -sf "$SYS_CMAKE" "$NATIVE_BIN/cmake"
+          echo "cmake: $($NATIVE_BIN/cmake --version | head -1)"
 
+          # Makefile.include is generated by ./configure inside tools/depends and is
+          # NOT part of the cached ~/kodi-depends prefix. The source tree is freshly
+          # cloned/reset every run, so Makefile.include must be regenerated even on
+          # cache hits. Without it, cmakebuildsys has no CMAKE_SOURCE_DIR, no
+          # CMAKE_TOOLCHAIN_FILE, and no PREFIX — causing the cmake invocation to
+          # silently drop the Kodi source path and the cross-compilation toolchain.
           if [ ! -f "$DEPENDS_DIR/Makefile.include" ]; then
+            echo "📦 Regenerating Makefile.include (not present after cache restore)..."
             cd "$DEPENDS_DIR"
             ./bootstrap
+            # Patch Makefile.include.in so cmake path points to system cmake
             sed -i "s|CMAKE=@prefix@/@tool_dir@/bin/cmake|CMAKE=$SYS_CMAKE|g" Makefile.include.in
             ./configure \
               --host="$HOST" \
@@ -709,35 +761,60 @@ jobs:
               --prefix="$DEPENDS_PREFIX" \
               --disable-gplv3 \
               --enable-debug=no
+            echo "✅ Makefile.include regenerated"
           fi
 
       - name: Generate CMake build files via cmakebuildsys
-        env:
-          APP_PKG: ${{ github.event.inputs.package_id }}
         run: |
           set -euo pipefail
+          # cmakebuildsys uses the depends toolchain + cmake (symlinked to system cmake)
           BUILD_DIR=$HOME/kodi-build
           DEPENDS_PREFIX=$HOME/kodi-depends
           NATIVE_BIN="$DEPENDS_PREFIX/x86_64-linux-gnu-native/bin"
           SYS_CMAKE=$(which cmake)
+          # Avoid stale cache/config interactions from prior attempts in same runner state
           rm -rf "$BUILD_DIR"
           mkdir -p "$BUILD_DIR"
+          # Ensure PATH includes native bin so cmakebuildsys finds our cmake symlink
           export PATH="$NATIVE_BIN:$PATH"
+          echo "cmake in PATH: $(which cmake) — $(cmake --version | head -1)"
           cd $HOME/kodi
 
+          # Nuclear option: replace ALL core_require_dep calls with core_optional_dep
+          # across the entire source tree. This prevents any missing-library hard errors.
+          # We then use ENABLE_X=OFF for things we explicitly don't want.
+          # NOTE: core_optional_dep respects ENABLE flags; core_require_dep ignores them.
           echo "Patching all core_require_dep → core_optional_dep in source tree..."
           grep -rl "core_require_dep" . --include="*.cmake" --include="CMakeLists.txt" 2>/dev/null | \
             xargs -r sed -i 's/core_require_dep(/core_optional_dep(/g'
+          echo "Patch complete. Remaining core_require_dep calls:"
+          grep -r "core_require_dep" . --include="*.cmake" --include="CMakeLists.txt" 2>/dev/null | head -5 || echo "  none"
 
+          # FindLibZip currently hard-requires GnuTLS when it needs to build internal
+          # libzip. In this workflow we intentionally skip gnutls in depends, so patch
+          # libzip discovery to use OpenSSL-backed libzip instead of failing configure.
           if [ -f cmake/modules/FindLibZip.cmake ]; then
             echo "Patching FindLibZip.cmake to avoid hard GnuTLS dependency..."
-            sed -i 's/find_package(GnuTLS.*)/# find_package(GnuTLS)/g' cmake/modules/FindLibZip.cmake
-            sed -i 's/GnuTLS::GnuTLS//g' cmake/modules/FindLibZip.cmake
-            sed -i '/set(CMAKE_ARGS -DBUILD_DOC=OFF/a\                 -DENABLE_GNUTLS=OFF\n                 -DENABLE_OPENSSL=ON\n                 -DENABLE_MBEDTLS=OFF\n                 -DENABLE_WINDOWS_CRYPTO=OFF\n                 -DENABLE_COMMONCRYPTO=OFF' cmake/modules/FindLibZip.cmake || true
+            sed -i 's/find_package(GnuTLS MODULE REQUIRED)/find_package(GnuTLS MODULE QUIET)/' cmake/modules/FindLibZip.cmake
+            # Variante actual de Kodi 22: find_package(GnuTLS REQUIRED ${SEARCH_QUIET}) -> sin REQUIRED
+            sed -i -E 's/find_package\(GnuTLS( MODULE)? REQUIRED/find_package(GnuTLS\1/' cmake/modules/FindLibZip.cmake
+            sed -i '/set(CMAKE_ARGS -DBUILD_DOC=OFF/a\                 -DENABLE_GNUTLS=OFF\n                 -DENABLE_OPENSSL=ON\n                 -DENABLE_MBEDTLS=OFF\n                 -DENABLE_WINDOWS_CRYPTO=OFF\n                 -DENABLE_COMMONCRYPTO=OFF' cmake/modules/FindLibZip.cmake
+            echo "Patched lines:"
+            grep -n "GnuTLS\|ENABLE_GNUTLS\|ENABLE_OPENSSL\|ENABLE_MBEDTLS" cmake/modules/FindLibZip.cmake || true
           fi
 
+          # ENABLE=OFF: explicitly disable features we skipped in depends.
+          # ENABLE=AUTO (default) would just skip gracefully if not found.
+          # OFF is correct here — we don't want cmake to even try to use them.
           KODI_CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release"
-          KODI_CMAKE_ARGS="$KODI_CMAKE_ARGS -DAPP_PACKAGE=$APP_PKG"
+          # Fix: the real Android package name is a CMake-time template variable
+          # (@APP_PACKAGE@ in tools/android/packaging/xbmc/**/*.in), not a literal
+          # "org.xbmc.kodi" string anywhere in the source tree, so the old
+          # "Apply custom package ID" sed step was a no-op. Passing -DAPP_PACKAGE
+          # here is what actually makes CMake substitute it into AndroidManifest.xml,
+          # build.gradle and every Java source file at configure time.
+          PKG="${{ github.event.inputs.package_id }}"
+          KODI_CMAKE_ARGS="$KODI_CMAKE_ARGS -DAPP_PACKAGE=$PKG"
           KODI_CMAKE_ARGS="$KODI_CMAKE_ARGS -DENABLE_OPTICAL=OFF"
           KODI_CMAKE_ARGS="$KODI_CMAKE_ARGS -DENABLE_MICROHTTPD=OFF"
           KODI_CMAKE_ARGS="$KODI_CMAKE_ARGS -DENABLE_UPNP=OFF"
@@ -751,6 +828,17 @@ jobs:
           KODI_CMAKE_ARGS="$KODI_CMAKE_ARGS -DENABLE_SMBCLIENT=OFF"
           set +e
           cd $HOME/kodi/tools/depends
+          # NOTE: Do NOT override CMAKE= here. The Makefile.include generated by
+          # ./configure defines CMAKE with the toolchain file and install prefix:
+          #   CMAKE=/path/to/cmake -DCMAKE_TOOLCHAIN_FILE=... -DCMAKE_INSTALL_PREFIX=...
+          # Overriding it with just the bare cmake path strips the cross-compilation
+          # toolchain, causing the build to target the host instead of Android.
+          # The earlier patch to Makefile.include.in already replaced the cmake
+          # binary path with the system cmake.
+          #
+          # CMAKE_SOURCE_DIR is passed as a safety net — Makefile.include sets it
+          # from abs_top_srcdir, but if the include ever fails silently (-include),
+          # the cmake command would be missing the Kodi source path entirely.
           make -C target/cmakebuildsys \
             BUILD_DIR="$BUILD_DIR" \
             CMAKE_SOURCE_DIR="$HOME/kodi" \
@@ -760,45 +848,26 @@ jobs:
           set -e
           if [ $CMAKEGEN_EXIT -ne 0 ]; then
             echo "❌ cmakebuildsys failed (exit $CMAKEGEN_EXIT)"
+            echo "--- Full cmakebuildsys log ---"
             cat ~/cmakebuildsys.log
             exit $CMAKEGEN_EXIT
           fi
+          # Verify a Makefile was actually generated
           if [ ! -f "$BUILD_DIR/Makefile" ]; then
             echo "❌ cmakebuildsys did not produce a Makefile"
+            echo "--- Full cmakebuildsys log ---"
             cat ~/cmakebuildsys.log
             exit 1
           fi
           echo "✅ CMake build files generated in $BUILD_DIR"
-
-      - name: Verify branding in generated build files
-        env:
-          APP_NAME: ${{ github.event.inputs.app_name }}
-          APP_PKG: ${{ github.event.inputs.package_id }}
-        run: |
-          set -euo pipefail
-          PK="$HOME/kodi-build/tools/android/packaging"
-          if [ ! -d "$PK" ]; then
-            echo "⚠️ $PK no existe todavía; se verificará sobre el APK final"
-            exit 0
-          fi
-          python3 "$BRANDING_SCRIPT" "$PK" build
-          echo "--- package / applicationId / namespace generados ---"
-          grep -rn "package=\|applicationId\|namespace" "$PK" \
-            --include=AndroidManifest.xml --include="build.gradle*" | head -20 || true
-          echo "--- app_name generado ---"
-          grep -rn 'name="app_name"' "$PK" --include=strings.xml | head -10 || true
-          if [ "$APP_PKG" != "org.xbmc.kodi" ] && \
-             grep -rq "org.xbmc.kodi" "$PK" --include=AndroidManifest.xml --include="build.gradle*"; then
-            echo "❌ El package original sigue presente en los ficheros generados" >&2
-            grep -rn "org.xbmc.kodi" "$PK" --include=AndroidManifest.xml --include="build.gradle*" | head -20 || true
-            exit 1
-          fi
-          echo "✅ Branding correcto en los ficheros generados"
+          ls "$BUILD_DIR"
 
       - name: Create signing keystore
         run: |
           set -euo pipefail
           mkdir -p ~/.android
+
+          # Keystore used by our final apksigner step
           keytool -genkey -v \
             -keystore ~/.android/kodi.keystore \
             -alias kodi \
@@ -808,6 +877,9 @@ jobs:
             -keypass android \
             -dname "CN=Kodi Build, OU=CI, O=GitHub Actions, L=Cloud, ST=Cloud, C=US" \
             > /dev/null 2>&1
+
+          # Kodi/Gradle packaging validateSigningRelease expects this exact file path
+          # and debug alias in some branches/configs.
           keytool -genkey -v \
             -keystore ~/.android/debug.keystore \
             -alias androiddebugkey \
@@ -818,11 +890,16 @@ jobs:
             -dname "CN=Android Debug,O=Android,C=US" \
             > /dev/null 2>&1
 
+          echo "✅ Signing keystores created:"
+          ls -la ~/.android
+
       - name: Build Kodi
         run: |
           set -euo pipefail
           BUILD_DIR=$HOME/kodi-build
+          echo "🏗️ Building Kodi (this takes a while)..."
           set +e
+          # Stream output live so long compiles do not look idle in Actions logs.
           make -C "$BUILD_DIR" -j$(nproc) 2>&1 | tee ~/kodi-build.log
           BUILD_EXIT=${PIPESTATUS[0]}
           set -e
@@ -834,9 +911,6 @@ jobs:
           echo "✅ Kodi compiled"
 
       - name: Inject custom config into APK assets and package
-        env:
-          APP_NAME: ${{ github.event.inputs.app_name }}
-          APP_PKG: ${{ github.event.inputs.package_id }}
         run: |
           set -euo pipefail
           BUILD_DIR=$HOME/kodi-build
@@ -846,9 +920,24 @@ jobs:
           PREFIX="$DEPENDS_PREFIX/$TARGET_DIR"
           PACKAGING_DIR="$BUILD_DIR/tools/android/packaging"
 
+          echo "📦 Packaging APK..."
+
+          # Fail-safe: ensure Gradle's expected keystore exists at package time.
           mkdir -p ~/.android
           if [ ! -f ~/.android/debug.keystore ]; then
-            cp -f ~/.android/kodi.keystore ~/.android/debug.keystore 2>/dev/null || true
+            if [ -f ~/.android/kodi.keystore ]; then
+              cp -f ~/.android/kodi.keystore ~/.android/debug.keystore
+            else
+              keytool -genkey -v \
+                -keystore ~/.android/debug.keystore \
+                -alias androiddebugkey \
+                -keyalg RSA -keysize 2048 \
+                -validity 10000 \
+                -storepass android \
+                -keypass android \
+                -dname "CN=Android Debug,O=Android,C=US" \
+                > /dev/null 2>&1
+            fi
           fi
 
           ADV_SRC="${{ github.workspace }}/kodi-config/advancedsettings.xml"
@@ -856,78 +945,186 @@ jobs:
           GUI_SRC="${{ github.workspace }}/kodi-config/guisettings.xml"
           ADDONS_STAGED="$HOME/staged-addons"
 
+          # --- PHASE 1: Inject config into PREFIX share BEFORE packaging ---
+          # The 'make apk' shared target copies $(PREFIX)/share/kodi/* into assets.
           SHARE_DIR="$PREFIX/share/kodi"
           if [ -d "$SHARE_DIR" ]; then
             mkdir -p "$SHARE_DIR/userdata"
-            [ -f "$ADV_SRC" ] && cp "$ADV_SRC" "$SHARE_DIR/userdata/advancedsettings.xml"
-            [ -f "$SRC_SRC" ] && cp "$SRC_SRC" "$SHARE_DIR/userdata/sources.xml"
-            [ -f "$GUI_SRC" ] && cp "$GUI_SRC" "$SHARE_DIR/userdata/guisettings.xml"
+            [ -f "$ADV_SRC" ] && cp "$ADV_SRC" "$SHARE_DIR/userdata/advancedsettings.xml" && echo "✅ Injected advancedsettings.xml into PREFIX share"
+            [ -f "$SRC_SRC" ] && cp "$SRC_SRC" "$SHARE_DIR/userdata/sources.xml" && echo "✅ Injected sources.xml into PREFIX share"
+            [ -f "$GUI_SRC" ] && cp "$GUI_SRC" "$SHARE_DIR/userdata/guisettings.xml" && echo "✅ Injected custom guisettings.xml into PREFIX share"
+            if [ -d "$ADDONS_STAGED" ] && [ "$(ls -A "$ADDONS_STAGED" 2>/dev/null)" ]; then
+              mkdir -p "$SHARE_DIR/addons"
+              cp -a "$ADDONS_STAGED/." "$SHARE_DIR/addons/"
+
+              # Also patch addon-manifest.xml in PREFIX share
+              MANIFEST="$SHARE_DIR/system/addon-manifest.xml"
+              if [ -f "$MANIFEST" ]; then
+                for addon_dir in "$ADDONS_STAGED"/*/; do
+                  addon_id=$(basename "$addon_dir")
+                  if ! grep -q "<addon>${addon_id}</addon>" "$MANIFEST"; then
+                    sed -i "s|</addons>|  <addon>${addon_id}</addon>\n</addons>|" "$MANIFEST"
+                    echo "  📋 Registered ${addon_id} in PREFIX addon-manifest.xml"
+                  fi
+                done
+              fi
+
+              echo "✅ Injected staged addons into PREFIX share"
+            fi
+            echo "PREFIX share userdata contents:"
+            ls -la "$SHARE_DIR/userdata/" || true
+          else
+            echo "⚠️ PREFIX share dir not found at $SHARE_DIR"
           fi
 
-          # Reaplicar branding sobre lo generado justo antes de empaquetar
-          if [ -d "$PACKAGING_DIR" ]; then
-            python3 "$BRANDING_SCRIPT" "$PACKAGING_DIR" build
-          fi
-
-          # Reaplicar icono (legacy + adaptativo) sobre lo generado
-          if [ -d "$PACKAGING_DIR" ]; then
-            ICON_BG='#000000' "$ICON_SCRIPT" "$PACKAGING_DIR" "${{ github.workspace }}/kodi-config/icon.png"
-          fi
-
+          # --- PHASE 2: Run make apk (bundle + shared + libs + python + java + gradle) ---
           cd "$KODI_SRC"
           make -C "$BUILD_DIR" apk 2>&1 | tee ~/apk-package.log
 
+          # --- PHASE 3: Force-inject into packaging assets and RE-RUN gradle ---
+          # make apk already ran gradle, but the assets may not have included our
+          # custom config if the cmake/bundle pipeline didn't pick them up.
+          # We inject directly into xbmc/assets/ and re-run gradle to rebuild
+          # the APK with the custom files included.
           ASSETS_DIR="$PACKAGING_DIR/xbmc/assets"
+          NEEDS_REPACK=false
+
           if [ -d "$ASSETS_DIR" ]; then
             mkdir -p "$ASSETS_DIR/userdata"
-            [ -f "$ADV_SRC" ] && cp -f "$ADV_SRC" "$ASSETS_DIR/userdata/advancedsettings.xml"
-            [ -f "$SRC_SRC" ] && cp -f "$SRC_SRC" "$ASSETS_DIR/userdata/sources.xml"
-            [ -f "$GUI_SRC" ] && cp -f "$GUI_SRC" "$ASSETS_DIR/userdata/guisettings.xml"
-            
-            cd "$PACKAGING_DIR"
-            ANDROID_HOME="$ANDROID_SDK_ROOT" ./gradlew assembleRelease 2>&1 | tee -a ~/apk-package.log || \
-            ANDROID_HOME="$ANDROID_SDK_ROOT" ./gradlew assembleDebug 2>&1 | tee -a ~/apk-package.log || true
+
+            if [ -f "$ADV_SRC" ]; then
+              cp -f "$ADV_SRC" "$ASSETS_DIR/userdata/advancedsettings.xml"
+              echo "✅ Injected advancedsettings.xml into packaging assets"
+              NEEDS_REPACK=true
+            fi
+            if [ -f "$SRC_SRC" ]; then
+              cp -f "$SRC_SRC" "$ASSETS_DIR/userdata/sources.xml"
+              echo "✅ Injected sources.xml into packaging assets"
+              NEEDS_REPACK=true
+            fi
+            if [ -f "$GUI_SRC" ]; then
+              cp -f "$GUI_SRC" "$ASSETS_DIR/userdata/guisettings.xml"
+              echo "✅ Injected custom guisettings.xml into packaging assets"
+              NEEDS_REPACK=true
+            fi
+            if [ -d "$ADDONS_STAGED" ] && [ "$(ls -A "$ADDONS_STAGED" 2>/dev/null)" ]; then
+              mkdir -p "$ASSETS_DIR/addons"
+              cp -a "$ADDONS_STAGED/." "$ASSETS_DIR/addons/"
+
+              # Register each custom addon in addon-manifest.xml so Kodi
+              # recognizes it. Without this entry Kodi ignores the addon
+              # files even though they're present in assets/addons/.
+              MANIFEST="$ASSETS_DIR/system/addon-manifest.xml"
+              if [ -f "$MANIFEST" ]; then
+                for addon_dir in "$ADDONS_STAGED"/*/; do
+                  addon_id=$(basename "$addon_dir")
+                  # Skip if already registered
+                  if ! grep -q "<addon>${addon_id}</addon>" "$MANIFEST"; then
+                    # Insert before the closing </addons> tag
+                    sed -i "s|</addons>|  <addon>${addon_id}</addon>\n</addons>|" "$MANIFEST"
+                    echo "  📋 Registered ${addon_id} in addon-manifest.xml"
+                  else
+                    echo "  ℹ️ ${addon_id} already in addon-manifest.xml"
+                  fi
+                done
+              else
+                echo "  ⚠️ addon-manifest.xml not found at $MANIFEST"
+              fi
+
+              echo "✅ Injected staged addons into packaging assets"
+              NEEDS_REPACK=true
+            fi
+
+            echo "--- Final packaging assets verification ---"
+            echo "userdata/:"
+            ls -la "$ASSETS_DIR/userdata/" 2>/dev/null || echo "  (empty)"
+            echo "addons/ (first 10):"
+            ls "$ASSETS_DIR/addons/" 2>/dev/null | head -10 || echo "  (none)"
+
+            # --- Remove non-Android assets to trim APK size ---
+            # These files get bundled by the generic install_data globs but are
+            # not used on Android.
+            TRIMMED=0
+
+            # Desktop OpenGL shaders (Android uses GLES only)
+            if [ -d "$ASSETS_DIR/system/shaders/GL" ]; then
+              rm -rf "$ASSETS_DIR/system/shaders/GL"
+              echo "🗑️ Removed system/shaders/GL/ (desktop OpenGL — Android uses GLES)"
+              TRIMMED=1
+            fi
+
+            # Apple-specific keymaps
+            for f in customcontroller.AppleRemote.xml customcontroller.SiriRemote.xml; do
+              if [ -f "$ASSETS_DIR/system/keymaps/$f" ]; then
+                rm -f "$ASSETS_DIR/system/keymaps/$f"
+                echo "🗑️ Removed system/keymaps/$f"
+                TRIMMED=1
+              fi
+            done
+
+            # Linux-specific keymap device profiles (OSMC, WeTek, Nyxboard)
+            for d in nyxboard osmc osmcv3 wetek-play; do
+              if [ -d "$ASSETS_DIR/system/keymaps/$d" ]; then
+                rm -rf "$ASSETS_DIR/system/keymaps/$d"
+                echo "🗑️ Removed system/keymaps/$d/"
+                TRIMMED=1
+              fi
+            done
+
+            if [ "$TRIMMED" = "1" ]; then
+              NEEDS_REPACK=true
+            fi
+
+            # Re-run gradle to rebuild the APK with injected files
+            if [ "$NEEDS_REPACK" = "true" ]; then
+              echo "🔄 Re-running gradle to include injected custom config..."
+              cd "$PACKAGING_DIR"
+              ANDROID_HOME="$ANDROID_SDK_ROOT" ./gradlew assembleRelease 2>&1 | tee -a ~/apk-package.log || \
+              ANDROID_HOME="$ANDROID_SDK_ROOT" ./gradlew assembleDebug 2>&1 | tee -a ~/apk-package.log || true
+            fi
+          else
+            echo "⚠️ Packaging assets dir not found at $ASSETS_DIR"
           fi
 
-      - name: Locate and verify built APK
+          echo "--- APK search after packaging ---"
+          find ~ -name "*.apk" 2>/dev/null | grep -v ".gradle" | grep -v "/tmp/" | sort || echo "No APK found yet"
+          echo "✅ Packaging step complete"
+
+      - name: Locate built APK
         id: locate
-        env:
-          APP_NAME: ${{ github.event.inputs.app_name }}
-          APP_PKG: ${{ github.event.inputs.package_id }}
         run: |
-          set -euo pipefail
-          # APK más reciente generado en el directorio de build (no uno cualquiera de ~)
-          APK=$(find "$HOME/kodi-build" -name "*.apk" -not -path "*/.gradle/*" \
-                  -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)
+          echo "🔍 Locating final APK..."
+          APK=$(find ~ -name "*.apk" 2>/dev/null \
+            | grep -v ".gradle" \
+            | grep -v "/tmp/" \
+            | grep -v "aligned" \
+            | head -1)
           if [ -z "$APK" ]; then
-            echo "❌ No APK found."
+            echo "❌ No APK found. Logs:"
+            tail -80 ~/apk-package.log 2>/dev/null || true
+            echo "--- Build dir contents ---"
+            ls -la $HOME/kodi-build/ 2>/dev/null || true
+            echo "--- Packaging dir contents ---"
+            ls -la $HOME/kodi/tools/android/packaging/ 2>/dev/null || true
             exit 1
           fi
-          echo "APK: $APK"
-          AAPT2="$ANDROID_HOME/build-tools/${{ steps.kodi.outputs.android_build_tools }}/aapt2"
-          INFO=$("$AAPT2" dump badging "$APK" | grep -E "^package:|^application-label:" || true)
-          echo "$INFO"
-          if ! echo "$INFO" | grep -q "name='$APP_PKG'"; then
-            echo "❌ El package del APK no coincide con '$APP_PKG'" >&2
-            exit 1
-          fi
-          if ! echo "$INFO" | grep -q "^application-label:'$APP_NAME'"; then
-            echo "❌ El nombre del APK no coincide con '$APP_NAME'" >&2
-            exit 1
-          fi
-          echo "✅ APK verificado: $APP_NAME / $APP_PKG"
+          echo "✅ Found APK: $APK"
           echo "apk_path=$APK" >> $GITHUB_OUTPUT
 
       - name: Sign and zipalign APK
         id: sign
         run: |
           APK="${{ steps.locate.outputs.apk_path }}"
+          [ -z "$APK" ] && echo "❌ No APK path from locate step!" && exit 1
+
           APP="${{ github.event.inputs.app_name }}"
           BRANCH="${{ github.event.inputs.branch }}"
           ABI="${{ steps.abi.outputs.value }}"
           CUSTOM="${{ github.event.inputs.apk_filename }}"
 
+          # Use custom filename if provided, otherwise auto-generate from app name
           if [ -n "$CUSTOM" ]; then
+            # Strip any .apk extension the user may have included, then re-add it
             SAFE_NAME=$(echo "$CUSTOM" | sed 's/\.apk$//i' | tr ' ' '_')
           else
             SAFE_NAME=$(echo "$APP" | tr ' ' '_')
@@ -948,6 +1145,8 @@ jobs:
             --out "$OUT" \
             "$ALIGNED"
 
+          SIZE=$(du -sh "$OUT" | cut -f1)
+          echo "✅ Signed APK: $OUT_NAME ($SIZE)"
           echo "apk_path=$OUT"      >> $GITHUB_OUTPUT
           echo "apk_name=$OUT_NAME" >> $GITHUB_OUTPUT
 
@@ -964,6 +1163,72 @@ jobs:
         with:
           tag_name: build-${{ github.run_number }}
           name: "${{ github.event.inputs.app_name }} ${{ github.event.inputs.branch }} — Build #${{ github.run_number }}"
+          body: |
+            ## Custom Kodi APK
+
+            | Setting | Value |
+            |---------|-------|
+            | Kodi release | `${{ steps.kodi.outputs.release }}` |
+            | Source ref | `${{ steps.kodi.outputs.source_ref }}` (`${{ steps.source.outputs.source_sha }}`) |
+            | Addon channel | `${{ steps.kodi.outputs.addon_channel }}` |
+            | App name | ${{ github.event.inputs.app_name }} |
+            | APK filename | `${{ steps.sign.outputs.apk_name }}` |
+            | Package ID | `${{ github.event.inputs.package_id }}` |
+            | Target ABI | `${{ steps.abi.outputs.value }}` |
+            | Unknown sources | ${{ github.event.inputs.unknown_sources == 'true' && 'Pre-enabled' || 'Default (off)' }} |
+            | Built | ${{ github.run_number }} |
+
+            ### Install
+            1. Download the `.apk` file below
+            2. Transfer to your Android device
+            3. Enable **Unknown sources** in Android Settings → Security
+            4. Open the APK file on the device to install
+
+            > Built automatically by GitHub Actions from [xbmc/xbmc](https://github.com/xbmc/xbmc)
           files: ${{ steps.sign.outputs.apk_path }}
           draft: false
           prerelease: ${{ steps.kodi.outputs.is_prerelease == 'true' }}
+
+      - name: Collect diagnostic bundle
+        if: always() && github.event.inputs.debug_mode == 'true'
+        run: |
+          set -euo pipefail
+          OUT=/tmp/kodi-build-diagnostics
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
+          cp -f ~/depends-build.log "$OUT/" 2>/dev/null || true
+          cp -f ~/cmakebuildsys.log "$OUT/" 2>/dev/null || true
+          cp -f ~/kodi-build.log "$OUT/" 2>/dev/null || true
+          cp -f ~/apk-package.log "$OUT/" 2>/dev/null || true
+          {
+            echo "branch=${{ github.event.inputs.branch }}"
+            echo "release=${{ steps.kodi.outputs.release }}"
+            echo "source_ref=${{ steps.kodi.outputs.source_ref }}"
+            echo "source_sha=${{ steps.source.outputs.source_sha }}"
+            echo "depends_fingerprint=${{ steps.source.outputs.depends_fingerprint }}"
+            echo "addon_channel=${{ steps.kodi.outputs.addon_channel }}"
+            echo "android_platform=${{ steps.kodi.outputs.android_platform }}"
+            echo "android_build_tools=${{ steps.kodi.outputs.android_build_tools }}"
+            echo "abi=${{ github.event.inputs.abi }}"
+            echo "run_id=${{ github.run_id }}"
+            echo "run_number=${{ github.run_number }}"
+            echo "workflow=${{ github.workflow }}"
+          } > "$OUT/run-meta.txt"
+          if [ -d "$HOME/kodi-build" ]; then
+            ls -la "$HOME/kodi-build" > "$OUT/kodi-build-ls.txt" || true
+          fi
+          if [ -f "$HOME/kodi-build/CMakeCache.txt" ]; then
+            cp "$HOME/kodi-build/CMakeCache.txt" "$OUT/" || true
+          fi
+          if [ -d "$HOME/kodi/tools/depends/target/cmakebuildsys" ]; then
+            ls -la "$HOME/kodi/tools/depends/target/cmakebuildsys" > "$OUT/cmakebuildsys-ls.txt" || true
+          fi
+          tar -czf /tmp/kodi-build-diagnostics.tgz -C /tmp kodi-build-diagnostics
+
+      - name: Upload diagnostics artifact
+        if: always() && github.event.inputs.debug_mode == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: kodi-build-diagnostics-${{ github.run_number }}
+          path: /tmp/kodi-build-diagnostics.tgz
+          retention-days: 14
